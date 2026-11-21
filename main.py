@@ -1,14 +1,17 @@
 """
-OLMABEK AI — backend (FastAPI + Google AI Studio / Gemini)
+OLMABEK AI — backend (FastAPI + Cloudflare Workers AI + Google Gemini)
+
+Arxitektura:
+    • Chat, rasm, veb-sayt → Cloudflare Workers AI (bitta CF_ACCOUNT_ID + CF_API_TOKEN)
+    • Kod (/api/code) va Codex (/api/codex) → Gemini
 
 Ishga tushirish:
     pip install -r requirements.txt
-    .env.example ni .env deb nusxalang va GEMINI_API_KEY ni yozing
-    python main.py            (yoki: uvicorn main:app --reload --port 8000)
+    cp .env.example .env    # 3 ta kalitni yozing
+    python main.py
 
-Eslatma: tarif (plan), user_id va is_admin brauzerdan keladi va serverda tekshirib bo'lmaydi
-(hisob tizimi yo'q). Limitlar oddiy foydalanuvchini to'xtatadi, lekin hiyla qilgan odamni emas.
-Haqiqiy himoya uchun keyingi qadam — serverda hisob (login) va tarifni bazada saqlash.
+Kerakli env:
+    CF_ACCOUNT_ID, CF_API_TOKEN, GEMINI_API_KEY
 """
 import base64
 import json
@@ -24,7 +27,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")  # kalit va sozlamalar .env faylidan o'qiladi
+load_dotenv(BASE_DIR / ".env")
 
 from fastapi import FastAPI, HTTPException, Request  # noqa: E402
 from starlette.exceptions import HTTPException as StarletteHTTPException  # noqa: E402
@@ -36,30 +39,28 @@ from google import genai  # noqa: E402
 from google.genai import types  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
-# ============================ SOZLAMALAR (.env) ============================
+# ============================ SOZLAMALAR ============================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
 CODE_MODEL = os.getenv("GEMINI_CODE_MODEL", "gemini-2.5-pro")
 IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "imagen-3.0-generate-002")
-# Asosiy model 404 bersa, shu ro'yxatdan ketma-ket sinab ko'riladi (vergul bilan). Oxirgi chora: kalitingizdagi mavjud modellar.
 FALLBACK_MODELS = [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash,gemini-2.0-flash").split(",") if m.strip()]
 IMAGE_FALLBACKS = [m.strip() for m in os.getenv("GEMINI_IMAGE_FALLBACK", "gemini-2.5-flash-image").split(",") if m.strip()]
 
-# ---- Cloudflare Workers AI: CHAT va RASM uchun (tez). Kod (Olmabek Codex) har doim Gemini'da. ----
 CF_ACCOUNT_ID = (os.getenv("CF_ACCOUNT_ID") or os.getenv("CLOUDFLARE_ACCOUNT_ID") or "").strip()
-CF_API_TOKEN = (os.getenv("CF_API_TOKEN") or os.getenv("CLOUDFLARE_API_TOKEN") or os.getenv("CLOUDFLARE_AUTH_TOKEN") or "").strip()
+CF_API_TOKEN = (os.getenv("CF_API_TOKEN") or os.getenv("CLOUDFLARE_API_TOKEN") or "").strip()
 CF_READY = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
-CF_CHAT_MODEL = os.getenv("CF_CHAT_MODEL", "@cf/google/gemma-3-12b-it")                   # Oddiy: o'zbekchani yaxshi biladi
-CF_CHAT_MODEL_PRO = os.getenv("CF_CHAT_MODEL_PRO", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")  # Pro va Ultra: kuchliroq
+
+CF_CHAT_MODEL = os.getenv("CF_CHAT_MODEL", "@cf/google/gemma-3-12b-it")
+CF_CHAT_MODEL_PRO = os.getenv("CF_CHAT_MODEL_PRO", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
 CF_CHAT_FALLBACKS = [m.strip() for m in os.getenv("CF_CHAT_FALLBACKS", "@cf/meta/llama-3.1-8b-instruct").split(",") if m.strip()]
 CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell")
-CF_IMAGE_STEPS = {"standard": 4, "pro": 6, "ultra": 8}                                     # flux: eng ko'pi 8
-CHAT_PROVIDER = os.getenv("CHAT_PROVIDER", "cloudflare" if CF_READY else "gemini").strip().lower()
-IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "cloudflare" if CF_READY else "gemini").strip().lower()
-IMAGE_TRANSLATE = os.getenv("IMAGE_TRANSLATE", "true").strip().lower() in ("1", "true", "yes")  # flux inglizchani yaxshi tushunadi
+CF_IMAGE_STEPS = {"standard": 4, "pro": 6, "ultra": 8}
+
+IMAGE_TRANSLATE = os.getenv("IMAGE_TRANSLATE", "true").strip().lower() in ("1", "true", "yes")
 FALLBACK_TO_GEMINI = os.getenv("FALLBACK_TO_GEMINI", "true").strip().lower() in ("1", "true", "yes")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()] or ["*"]
-HOST = os.getenv("HOST", "127.0.0.1")
+HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 USAGE_FILE = Path(os.getenv("USAGE_FILE", str(BASE_DIR / "usage.json")))
 
@@ -75,7 +76,6 @@ app.add_middleware(
 )
 
 # ============================ TARIF LIMITLARI (kunlik) ============================
-# None = cheksiz. Saytdagi raqamlar bilan bir xil bo'lishi kerak.
 CHAT_LIMITS: Dict[str, Optional[int]] = {"standard": 25, "pro": 150, "ultra": None}
 IMAGE_LIMITS: Dict[str, Optional[int]] = {"standard": 8, "pro": 20, "ultra": 80}
 CODE_TOKEN_LIMITS: Dict[str, Optional[int]] = {"standard": 25_000, "pro": 250_000, "ultra": 2_000_000}
@@ -89,7 +89,7 @@ QUOTA_MESSAGES = {
 }
 LIMITS_BY_KIND = {"chat": CHAT_LIMITS, "images": IMAGE_LIMITS, "tokens": CODE_TOKEN_LIMITS, "sites": SITE_LIMITS}
 
-# ============================ FOYDALANISH HISOBI (usage.json) ============================
+# ============================ FOYDALANISH HISOBI ============================
 _lock = threading.Lock()
 usage_db: Dict[str, dict] = {}
 
@@ -104,7 +104,6 @@ def _load_usage() -> None:
 
 
 def _save_usage() -> None:
-    """Server qayta ishga tushsa ham limitlar yo'qolmasligi uchun faylga yozamiz (atomik)."""
     try:
         today = date.today().isoformat()
         fresh = {k: v for k, v in usage_db.items() if v.get("day") == today}
@@ -133,7 +132,6 @@ def tier_of(plan: Optional[str]) -> str:
 
 
 def left_of(uid: str, plan: str, admin: bool, kind: str) -> Optional[int]:
-    """Qolgan miqdor; None = cheksiz."""
     if admin:
         return None
     limit = LIMITS_BY_KIND[kind][tier_of(plan)]
@@ -157,7 +155,7 @@ def consume(uid: str, plan: str, admin: bool, kind: str, amount: int = 1) -> Opt
     return left_of(uid, plan, admin, kind)
 
 
-# ============================ MA'LUMOT MODELLARI ============================
+# ============================ MODELLAR ============================
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -204,13 +202,12 @@ def require_client() -> genai.Client:
     if client is None:
         raise HTTPException(
             status_code=500,
-            detail="Serverda GEMINI_API_KEY sozlanmagan. .env fayliga kalitni yozing va serverni qayta ishga tushiring.",
+            detail="Serverda GEMINI_API_KEY sozlanmagan. .env fayliga kalitni yozing.",
         )
     return client
 
 
 def friendly(e: Exception) -> str:
-    """Gemini xatolarini tushunarli o'zbekcha xabarga aylantiradi."""
     t = str(e)
     low = t.lower()
     if "api key" in low or "api_key" in low or "permission" in low or "403" in low or "401" in low:
@@ -218,7 +215,7 @@ def friendly(e: Exception) -> str:
     if "429" in t or "quota" in low or "resource_exhausted" in low or "rate" in low:
         return "Gemini limiti vaqtincha tugadi. Birozdan keyin qayta urinib ko'ring."
     if "404" in t or "not found" in low:
-        return "Model topilmadi. .env dagi GEMINI_*_MODEL nomini tekshiring (GET /api/models ro'yxatni ko'rsatadi)."
+        return "Model topilmadi. GET /api/models ro'yxatidan tekshiring."
     if any(k in low for k in ("name or service not known", "getaddrinfo", "connection", "timed out", "timeout", "unreachable")):
         return "Gemini serveriga ulanib bo'lmadi. Internetni tekshiring."
     if "safety" in low or "blocked" in low:
@@ -251,7 +248,7 @@ def read_usage(um: Any, out_chars: int, in_chars: int) -> Tuple[int, int, int]:
     return p, o, t
 
 
-_resolved: Dict[str, str] = {}          # qaysi model ishlaganini eslab qoladi
+_resolved: Dict[str, str] = {}
 _discovered: Dict[str, Any] = {"t": 0.0, "names": []}
 _SKIP = ("image", "tts", "live", "embed", "audio", "native", "robotics", "computer", "aqa", "imagen", "veo", "learnlm")
 
@@ -262,7 +259,6 @@ def is_model_error(e: Exception) -> bool:
 
 
 def discover_models(ai: genai.Client) -> List[str]:
-    """Kalitingiz uchun haqiqatan mavjud matn modellari (flash birinchi). 10 daqiqa eslab turiladi."""
     if _discovered["names"] and time.time() - _discovered["t"] < 600:
         return _discovered["names"]
     try:
@@ -272,7 +268,7 @@ def discover_models(ai: genai.Client) -> List[str]:
             actions = getattr(m, "supported_actions", None) or []
             if nm.startswith("gemini") and (not actions or "generateContent" in actions) and not any(k in nm for k in _SKIP):
                 names.append(nm)
-        names.sort(key=lambda n: (0 if "flash" in n and "lite" not in n else 1, n), reverse=False)
+        names.sort(key=lambda n: (0 if "flash" in n and "lite" not in n else 1, n))
         _discovered.update(t=time.time(), names=names)
     except Exception:
         pass
@@ -288,7 +284,6 @@ def model_queue(primary: str) -> List[str]:
 
 
 def generate_with_fallback(ai: genai.Client, primary: str, contents, system: str, temperature: float):
-    """404 / model topilmasa keyingi modelga avtomatik o'tadi. (javob, ishlatilgan_model) qaytaradi."""
     queue, last, extended = model_queue(primary), None, False
     while queue:
         m = queue.pop(0)
@@ -307,7 +302,6 @@ def generate_with_fallback(ai: genai.Client, primary: str, contents, system: str
 
 
 def iter_gemini(ai: genai.Client, model: str, contents, system: str, temperature: float, max_tokens: Optional[int] = None) -> Iterator[Tuple[str, Any]]:
-    """Oqimli generatsiya. Model topilmasa (hali hech narsa kelmagan bo'lsa) keyingisiga o'tadi."""
     cfg: Dict[str, Any] = {"system_instruction": system, "temperature": temperature}
     if max_tokens:
         cfg["max_output_tokens"] = max_tokens
@@ -331,7 +325,6 @@ def iter_gemini(ai: genai.Client, model: str, contents, system: str, temperature
 
 
 def make_image(ai: genai.Client, prompt: str) -> bytes:
-    """Imagen (asosiy) yoki Gemini rasm modeli (zaxira). Birinchi ishlaganini qaytaradi."""
     last: Optional[Exception] = None
     for m in [IMAGE_MODEL] + IMAGE_FALLBACKS:
         try:
@@ -383,12 +376,11 @@ def cf_error_text(status: int, raw: str) -> str:
     if "neurons" in low or "daily free allocation" in low or status == 429:
         return "Cloudflare kunlik bepul limiti tugadi."
     if status == 404 or "no such model" in low or "not found" in low:
-        return "Cloudflare modeli topilmadi. .env dagi CF_CHAT_MODEL / CF_IMAGE_MODEL nomini tekshiring."
+        return "Cloudflare modeli topilmadi. CF_CHAT_MODEL / CF_IMAGE_MODEL ni tekshiring."
     return f"Cloudflare xatosi ({status}): {msg[:200]}"
 
 
 def cf_text(obj: Any) -> str:
-    """Cloudflare javobidan matnni oladi (eski {"response": ".."} va OpenAI uslubidagi {"choices": [..]} ikkalasi ham)."""
     if not isinstance(obj, dict):
         return ""
     if isinstance(obj.get("response"), str):
@@ -441,8 +433,7 @@ def cf_stream(model: str, messages: List[Dict[str, str]], max_tokens: int) -> It
 
 
 def cf_stream_with_fallback(plan: str, messages: List[Dict[str, str]]) -> Iterator[str]:
-    """Model topilmasa (404/400) keyingi Cloudflare modeliga o'tadi; token/limit xatosida to'xtaydi."""
-    max_tokens = 4096 if plan in ("pro", "ultra") else 2048   # Cloudflare standarti juda kichik (256) — javob kesilib qoladi
+    max_tokens = 4096 if plan in ("pro", "ultra") else 2048
     last: Optional[Exception] = None
     for model in cf_chat_models(plan):
         started = False
@@ -458,17 +449,16 @@ def cf_stream_with_fallback(plan: str, messages: List[Dict[str, str]]) -> Iterat
     raise last if last else CFError(500, "Cloudflare modeli topilmadi")
 
 
-def cf_complete(system: str, user: str, max_tokens: int = 220, timeout: float = 15.0) -> str:
+def cf_complete(system: str, user: str, max_tokens: int = 220, timeout: float = 15.0, model: Optional[str] = None) -> str:
     body = {"messages": [{"role": "system", "content": system}, {"role": "user", "content": user}], "max_tokens": max_tokens, "temperature": 0.2}
     with httpx.Client(timeout=timeout) as c:
-        r = c.post(cf_url(CF_CHAT_MODEL), headers=cf_headers(), json=body)
+        r = c.post(cf_url(model or CF_CHAT_MODEL), headers=cf_headers(), json=body)
     if r.status_code != 200:
         raise CFError(r.status_code, cf_error_text(r.status_code, r.text))
     return cf_text(r.json()).strip()
 
 
 def cf_to_english(prompt: str) -> str:
-    """Rasm modeli inglizchani yaxshi tushunadi: o'zbekcha/ruscha tavsifni qisqa ingliz tiliga o'giradi. Xato bo'lsa asl matn qoladi."""
     try:
         out = cf_complete(
             "You turn an image description (any language) into one vivid, concise English prompt for a text-to-image model. "
@@ -499,11 +489,11 @@ def cf_image_b64(prompt: str, steps: int) -> str:
 
 
 def chat_uses_cf() -> bool:
-    return CHAT_PROVIDER == "cloudflare" and CF_READY
+    return CF_READY
 
 
 def image_uses_cf() -> bool:
-    return IMAGE_PROVIDER == "cloudflare" and CF_READY
+    return CF_READY
 
 
 def chat_model_label(plan: str) -> str:
@@ -515,7 +505,6 @@ def error_text(e: Exception) -> str:
 
 
 def chat_text_stream(plan: str, deep: bool, history: Optional[List[ChatMessage]], message: str) -> Iterator[str]:
-    """CHAT: avval Cloudflare (tez). U ishlamasa va hali javob boshlanmagan bo'lsa — Gemini (zaxira)."""
     system = chat_system_instruction(plan, deep)
     if chat_uses_cf():
         started = False
@@ -603,11 +592,25 @@ def codex_system_instruction(plan: str) -> str:
     ])
 
 
+def build_site_system_instruction(plan: str, admin: bool) -> str:
+    premium = plan in ("pro", "ultra") or admin
+    tier = ("Zamonaviy, animatsiyali, mukammal responsive dizayn, interaktiv JavaScript va boy kontent bilan yarat."
+            if premium else "Toza, tushunarli, chiroyli va to'liq ishlaydigan oddiy veb-sahifa (HTML + CSS + JS) yarat.")
+    return (
+        "Sen professional Frontend dasturchi va UI/UX dizaynersan.\n"
+        "Vazifang: foydalanuvchi so'roviga ko'ra tayyor, yagona faylli, to'liq ishlaydigan veb-sayt kodini yozish.\n"
+        f"1. {tier}\n"
+        "2. Barcha CSS va JS bitta <!DOCTYPE html> hujjati ichida bo'lsin (iframe Preview uchun).\n"
+        "3. Hech qanday tushuntirish yoki markdown yozma! Faqat toza HTML kodning o'zini qaytar.\n"
+        "4. Matnlar asosan o'zbek tilida bo'lsin."
+    )
+
+
 def select_model(plan: str, is_code: bool) -> str:
     return CODE_MODEL if (is_code and plan in ("pro", "ultra")) or plan == "ultra" else CHAT_MODEL
 
 
-# ============================ XATOLAR — {"error": "..."} ko'rinishida ============================
+# ============================ XATOLAR ============================
 @app.exception_handler(StarletteHTTPException)
 async def http_error(request: Request, exc: HTTPException):
     msg = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
@@ -630,7 +633,7 @@ async def server_error(_: Request, exc: Exception):
     return JSONResponse({"error": msg, "detail": msg}, status_code=500)
 
 
-# ============================ FRONTEND (faqat 3 ta fayl; .env hech qachon berilmaydi) ============================
+# ============================ FRONTEND ============================
 def _static(name: str):
     path = BASE_DIR / name
     if not path.is_file():
@@ -641,11 +644,16 @@ def _static(name: str):
 def health_payload() -> dict:
     return {
         "ok": True, "status": "ok", "service": "Olmabek AI Server",
-        "model": CHAT_MODEL, "codeModel": CODE_MODEL, "imageModel": IMAGE_MODEL,
-        "geminiConfigured": bool(GEMINI_API_KEY), "cloudflareConfigured": CF_READY,
+        "geminiConfigured": bool(GEMINI_API_KEY),
+        "cloudflareConfigured": CF_READY,
         "chatProvider": "cloudflare" if chat_uses_cf() else "gemini",
         "imageProvider": "cloudflare" if image_uses_cf() else "gemini",
-        "cfChatModel": CF_CHAT_MODEL if CF_READY else None, "cfImageModel": CF_IMAGE_MODEL if CF_READY else None,
+        "siteProvider": "cloudflare" if CF_READY else "gemini",
+        "codeProvider": "gemini",
+        "cfChatModel": CF_CHAT_MODEL if CF_READY else None,
+        "cfImageModel": CF_IMAGE_MODEL if CF_READY else None,
+        "geminiChatModel": CHAT_MODEL,
+        "geminiCodeModel": CODE_MODEL,
     }
 
 
@@ -677,7 +685,6 @@ def health_check():
 
 @app.get("/api/models")
 def list_models():
-    """Kalitingiz bilan ishlaydigan model nomlari (model topilmasa shu yerdan tanlang)."""
     ai = require_client()
     try:
         names = []
@@ -705,7 +712,7 @@ def get_limits(user_id: str = "guest", plan: str = "standard", is_admin: bool = 
     }
 
 
-# ============================ 1. CHAT (Cloudflare) va OLMABEK CODE (Gemini) — JSON ============================
+# ============================ 1. CHAT (Cloudflare) va CODE (Gemini) — JSON ============================
 @app.post("/api/chat")
 @app.post("/api/code")
 def generate_sync(req: ChatRequest):
@@ -730,13 +737,13 @@ def generate_sync(req: ChatRequest):
     system = code_system_instruction(plan, req.stack or "auto")
     contents = build_contents(req.history, message, req.currentCode)
     try:
-        resp, model = generate_with_fallback(ai, select_model(plan, True), contents, system, 0.5)
+        resp, used_model = generate_with_fallback(ai, select_model(plan, True), contents, system, 0.5)
     except Exception as e:
         raise HTTPException(status_code=500, detail=friendly(e))
     reply = resp.text or "Javob bo'sh qaytdi."
     p, o, t = read_usage(getattr(resp, "usage_metadata", None), len(reply), len(message))
     left = consume(uid, plan, admin, "tokens", t)
-    return {"reply": reply, "usage": {"promptTokens": p, "outputTokens": o, "totalTokens": t, "tokensLeft": left, "model": model}}
+    return {"reply": reply, "usage": {"promptTokens": p, "outputTokens": o, "totalTokens": t, "tokensLeft": left, "model": used_model}}
 
 
 # ============================ 2. OQIMLI CHAT va CODE ============================
@@ -768,12 +775,12 @@ def stream_handler(req: ChatRequest, force_code: bool = False):
     ai = require_client()
     system = code_system_instruction(plan, req.stack or "auto")
     contents = build_contents(req.history, message, req.currentCode)
-    model = select_model(plan, True)
+    primary_model = select_model(plan, True)
 
     def code_events():
         chars, um_last = 0, None
         try:
-            for text, um in iter_gemini(ai, model, contents, system, 0.5):
+            for text, um in iter_gemini(ai, primary_model, contents, system, 0.5):
                 if um:
                     um_last = um
                 if text:
@@ -782,7 +789,7 @@ def stream_handler(req: ChatRequest, force_code: bool = False):
             p, o, t = read_usage(um_last, chars, len(message))
             left = consume(uid, plan, admin, "tokens", t)
             if not plain:
-                yield sse_line({"type": "usage", "promptTokens": p, "outputTokens": o, "totalTokens": t, "tokensLeft": left, "model": model})
+                yield sse_line({"type": "usage", "promptTokens": p, "outputTokens": o, "totalTokens": t, "tokensLeft": left, "model": primary_model})
                 yield sse_line({"type": "done"})
         except Exception as e:
             yield f"\n⚠️ Xatolik: {friendly(e)}" if plain else sse_line({"type": "error", "error": friendly(e)})
@@ -800,10 +807,9 @@ def code_stream(req: ChatRequest):
     return stream_handler(req, force_code=True)
 
 
-# ============================ 3. OLMABEK CODEX (faqat Ultra) ============================
+# ============================ 3. CODEX (faqat Ultra, Gemini) ============================
 @app.get("/api/codex")
 def codex_status():
-    """Diagnostika: marshrut ulanganmi va kalit o'rnatilganmi."""
     return {"ok": True, "model": CODE_MODEL, "key_set": bool(GEMINI_API_KEY)}
 
 
@@ -838,7 +844,7 @@ def codex(req: CodexRequest):
     return StreamingResponse(events(), media_type="text/plain; charset=utf-8", headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
 
 
-# ============================ 4. RASM (/api/image) — Cloudflare Flux, zaxira: Gemini ============================
+# ============================ 4. RASM (Cloudflare Flux, zaxira Gemini) ============================
 @app.post("/api/image")
 def image(req: ImageRequest):
     prompt = (req.prompt or "").strip()
@@ -865,48 +871,98 @@ def image(req: ImageRequest):
     return {"image": b64, "imagesLeft": left}
 
 
-# ============================ 5. VEB-SAYT YARATISH (/api/build-site) ============================
+# ============================ 5. VEB-SAYT YARATISH (Cloudflare, zaxira Gemini) ============================
+def cf_generate_site(system: str, user: str, plan: str) -> str:
+    """Cloudflare orqali HTML sayt generatsiyasi (non-stream)."""
+    model = CF_CHAT_MODEL_PRO if plan in ("pro", "ultra") else CF_CHAT_MODEL
+    body = {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": 8192 if plan in ("pro", "ultra") else 6144,
+        "temperature": 0.6,
+    }
+    last: Optional[Exception] = None
+    for m in [model, CF_CHAT_MODEL] + CF_CHAT_FALLBACKS:
+        try:
+            with httpx.Client(timeout=httpx.Timeout(180.0, connect=10.0)) as c:
+                r = c.post(cf_url(m), headers=cf_headers(), json=body)
+            if r.status_code != 200:
+                raise CFError(r.status_code, cf_error_text(r.status_code, r.text))
+            text = cf_text(r.json()).strip()
+            if text:
+                return text
+        except Exception as e:
+            last = e
+    raise last if last else CFError(500, "Cloudflare sayt yaratmadi")
+
+
 @app.post("/api/build-site")
 def build_site(req: SiteBuildRequest):
-    ai = require_client()
     uid, plan, admin = who(req)
     require_quota(uid, plan, admin, "sites")
-    premium = plan in ("pro", "ultra") or admin
-    model = CODE_MODEL if plan == "ultra" else CHAT_MODEL
-    tier = ("Zamonaviy, animatsiyali, mukammal responsive dizayn, interaktiv JavaScript va boy kontent bilan yarat."
-            if premium else "Toza, tushunarli, chiroyli va to'liq ishlaydigan oddiy veb-sahifa (HTML + CSS + JS) yarat.")
-    system = (
-        "Sen professional Frontend dasturchi va UI/UX dizaynersan.\n"
-        "Vazifang: foydalanuvchi so'roviga ko'ra tayyor, yagona faylli, to'liq ishlaydigan veb-sayt kodini yozish.\n"
-        f"1. {tier}\n"
-        "2. Barcha CSS va JS bitta <!DOCTYPE html> hujjati ichida bo'lsin (iframe Preview uchun).\n"
-        "3. Hech qanday tushuntirish yoki markdown yozma! Faqat toza HTML kodning o'zini qaytar.\n"
-        "4. Matnlar asosan o'zbek tilida bo'lsin."
-    )
+    system = build_site_system_instruction(plan, admin)
+
     if req.current_code and req.current_code.strip():
-        user = f"Mavjud veb-sayt kodini talabga moslab tahrirla va yangilangan TO'LIQ kodni qaytar.\n\nTALAB: {req.prompt}\n\nMAVJUD KOD:\n{req.current_code}"
+        user = (f"Mavjud veb-sayt kodini talabga moslab tahrirla va yangilangan TO'LIQ kodni qaytar.\n\n"
+                f"TALAB: {req.prompt}\n\nMAVJUD KOD:\n{req.current_code}")
     else:
         user = f"Quyidagi talab asosida yangi veb-sayt yarat:\n{req.prompt}"
-    try:
-        resp, model = generate_with_fallback(ai, model, user, system, 0.6)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=friendly(e))
-    html = clean_html_output(resp.text or "")
+
+    html: Optional[str] = None
+    used_model = ""
+    tokens_used = 0
+
+    # 1) Cloudflare (asosiy)
+    if CF_READY:
+        try:
+            raw = cf_generate_site(system, user, plan)
+            html = clean_html_output(raw)
+            used_model = "cloudflare"
+            tokens_used = max(1, int((len(user) + len(html)) / 4))
+        except Exception as e:
+            if not (FALLBACK_TO_GEMINI and client is not None):
+                raise HTTPException(status_code=500, detail=error_text(e))
+            print(f"[build-site] Cloudflare ishlamadi ({error_text(e)}) -> Gemini zaxirasi")
+
+    # 2) Gemini zaxirasi
+    if html is None:
+        ai = require_client()
+        primary = CODE_MODEL if plan == "ultra" else CHAT_MODEL
+        try:
+            resp, used_model = generate_with_fallback(ai, primary, user, system, 0.6)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=friendly(e))
+        html = clean_html_output(resp.text or "")
+        _, _, tokens_used = read_usage(getattr(resp, "usage_metadata", None), len(html), len(user))
+
     if not html:
         raise HTTPException(status_code=500, detail="Kod yaratilmadi")
-    _, _, t = read_usage(getattr(resp, "usage_metadata", None), len(html), len(user))
-    consume(uid, plan, admin, "tokens", t)
+
+    consume(uid, plan, admin, "tokens", tokens_used)
     sites_left = consume(uid, plan, admin, "sites", 1)
-    return {"ready": True, "html": html, "sitesLeft": sites_left, "tokensUsed": t, "tokensLeft": left_of(uid, plan, admin, "tokens")}
+    return {
+        "ready": True,
+        "html": html,
+        "sitesLeft": sites_left,
+        "tokensUsed": tokens_used,
+        "tokensLeft": left_of(uid, plan, admin, "tokens"),
+        "model": used_model,
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
 
     if not GEMINI_API_KEY:
-        print("⚠️  GEMINI_API_KEY topilmadi. .env.example ni .env ga nusxalab, kalitni yozing.")
-    print(f"▶ Olmabek AI server: http://{HOST}:{PORT}")
-    print(f"   Chat: {'Cloudflare' if chat_uses_cf() else 'Gemini'} | Rasm: {'Cloudflare' if image_uses_cf() else 'Gemini'} | Kod: Gemini")
+        print("⚠️  GEMINI_API_KEY topilmadi — codex ishlamaydi, faqat chat/rasm/sayt ishlaydi.")
     if not CF_READY:
-        print("   (Cloudflare kalitlari yo'q: chat va rasm ham Gemini'da ishlaydi. CF_ACCOUNT_ID va CF_API_TOKEN ni .env ga yozing.)")
+        print("⚠️  CF_ACCOUNT_ID yoki CF_API_TOKEN topilmadi — chat/rasm/sayt Gemini zaxirasida ishlaydi.")
+
+    print(f"▶ Olmabek AI server: http://{HOST}:{PORT}")
+    print(f"   Chat:  {'Cloudflare' if CF_READY else 'Gemini'}")
+    print(f"   Rasm:  {'Cloudflare' if CF_READY else 'Gemini'}")
+    print(f"   Sayt:  {'Cloudflare' if CF_READY else 'Gemini'}")
+    print(f"   Kod/Codex: Gemini ({CODE_MODEL})")
     uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
