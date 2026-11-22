@@ -18,9 +18,27 @@
   const THEME_KEY   = 'olmabek_theme';
   const ADMIN_KEY   = 'olmabek_admin';
   const MAX_CHATS   = 50;
-  // Fayl sifatida (file://) yoki localhost'dan ochilsa — kompyuteringizdagi server (python main.py); aks holda Render
+  // Server manzili. Fayl (file://) yoki localhost'dan ochilsa avval kompyuterdagi server (python main.py),
+  // u ishlamasa Render sinab ko'riladi. Sayt internetga joylangan bo'lsa — faqat Render.
+  const LOCAL_API = 'http://127.0.0.1:8000', REMOTE_API = 'https://olmabekaiweb.onrender.com';
   const IS_LOCAL = location.protocol === 'file:' || ['localhost', '127.0.0.1'].includes(location.hostname);
-  const API_BASE = IS_LOCAL ? 'http://127.0.0.1:8000' : 'https://olmabekaiweb.onrender.com';
+  const API_CANDIDATES = IS_LOCAL ? [LOCAL_API, REMOTE_API] : [REMOTE_API];
+  let API_BASE = API_CANDIDATES[0];
+  const apiDownMsg = () => IS_LOCAL
+    ? "Server ishlamayapti. start.bat faylini oching (yoki terminalda: python main.py), keyin qayta urinib ko'ring."
+    : "Serverga ulanib bo'lmadi. Server uyg'onayotgan bo'lishi mumkin: 30 soniyadan keyin qayta urinib ko'ring.";
+  async function detectApi() {
+    for (const base of API_CANDIDATES) {
+      const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), base === REMOTE_API ? 12000 : 2500);
+      try {
+        const r = await fetch(base + '/api/health', { signal: ctl.signal });
+        clearTimeout(timer);
+        if (r.ok) { API_BASE = base; return true; }
+      } catch { clearTimeout(timer); }
+    }
+    return false;
+  }
+  setTimeout(() => detectApi().then(ok => { if (!ok) toast(apiDownMsg()); }), 700);
   // Serverga har so'rovda yuboriladi: tarif, foydalanuvchi va admin belgisi (limitlar serverda hisoblanadi)
   const apiMeta = () => ({ plan: document.documentElement.dataset.plan || 'standard', user_id: (state.user && state.user.email) || 'guest', is_admin: !!state.isAdmin });
 
@@ -40,7 +58,7 @@
     },
     codex: {
       placeholder: "Nima yaratamiz? Masalan: kiyim do'koni uchun landing sahifa",
-      note: "Olmabek   Yaratilgan kodni ishlatishdan oldin tekshiring."
+      note: "Olmabek Codex Gemini bilan ishlaydi. Yaratilgan kodni ishlatishdan oldin tekshiring."
     }
   };
 
@@ -1032,7 +1050,7 @@
   const apFx = NeonFX($('apCosmos'));
   window.addEventListener('resize', () => apFx.resize());
 
-  // ===== OLMABEK CODEX () =====
+  // ===== OLMABEK CODEX (Gemini) =====
   const cxView = $('codexView'), cxLog = $('cxLog'), cxFrame = $('cxFrame'), cxCodeEl = $('cxCode');
   const cx = { code: '', history: [] };
   function cxParse(t) {
@@ -1067,7 +1085,7 @@
     state.isSending = true; input.value = ''; autoResize(); sendBtn.disabled = false; setStopUI(true);
     $('cxWelcome').style.display = 'none';
     cxAdd(esc(text), 'cx-u');
-    const card = cxAdd('<div class="cx-a-h"><i class="cx-orb"></i><b>Olmabek Codex</b><span></span></div><div class="cx-plan"></div>' +
+    const card = cxAdd('<div class="cx-a-h"><i class="cx-orb"></i><b>Olmabek Codex</b><span>Gemini</span></div><div class="cx-plan"></div>' +
       '<div class="cx-steps"><div class="cx-step on" data-s="0"><i></i>Reja tuzilmoqda</div><div class="cx-step" data-s="1"><i></i>Kod yozilmoqda <em></em></div><div class="cx-step" data-s="2"><i></i>Preview tayyorlanmoqda</div></div>' +
       '<div class="cx-live" style="display:none"><pre></pre></div><div class="cx-after"></div>', 'cx-a');
     const q = sel => card.querySelector(sel);
@@ -1112,7 +1130,7 @@
       card.querySelectorAll('.cx-step.on').forEach(el => el.classList.remove('on'));
       if (err.name === 'AbortError') q('.cx-after').innerHTML = '<div class="cx-note">To\'xtatildi.</div>';
       else {
-        const msg = err.message === 'Failed to fetch' ? "Serverga ulanib bo'lmadi" : err.message;
+        const msg = err.message === 'Failed to fetch' ? apiDownMsg() : err.message;
         q('.cx-after').innerHTML = '<div class="cx-note bad">⚠ ' + esc(msg) + '</div>';
         logReq({ mode: 'codex', text, ok: false, err: msg });
       }
@@ -1346,7 +1364,16 @@
       }],
       ['Oqimli javob', async () => { const r = await fetch(API_BASE + '/api/chat/stream', { signal: tmo(15000) }); return r.status === 404 ? ['warn', "Serverda yo'q · oddiy rejimda ishlaydi"] : ['ok', 'Mavjud']; }],
       ['Rasm serveri', async () => { const r = await fetch(API_BASE + '/api/image', { signal: tmo(15000) }); if (r.status === 404) throw new Error('Topilmadi (404)'); return ['ok', 'Mavjud']; }],
-      ['Olmabek Codex ', async () => {
+      ['AI provayderlari', async () => {
+        const r = await fetch(API_BASE + '/api/health', { signal: tmo(15000) });
+        const j = await r.json();
+        const names = { cloudflare: 'Cloudflare', gemini: 'Gemini' };
+        const info = 'Chat: ' + (names[j.chatProvider] || '?') + ' · Rasm: ' + (names[j.imageProvider] || '?') + ' · Kod: Gemini';
+        if ((j.chatProvider === 'gemini' || j.imageProvider === 'gemini') && !j.cloudflareConfigured) return ['warn', "Cloudflare kalitlari yo'q (sekinroq) · " + info];
+        if (!j.geminiConfigured) return ['warn', "GEMINI_API_KEY yo'q: Codex ishlamaydi · " + info];
+        return ['ok', info];
+      }],
+      ['Olmabek Codex (Gemini)', async () => {
         const r = await fetch(API_BASE + '/api/codex', { signal: tmo(15000) });
         if (r.status === 404) throw new Error('Topilmadi: main.py yangilanmagan');
         let j = {}; try { j = await r.json(); } catch {}
@@ -1483,7 +1510,7 @@
       });
     } catch (e) {
       if (e.name === 'AbortError') throw e;
-      throw new Error("Serverga ulanib bo'lmadi");
+      throw new Error(apiDownMsg());
     }
     if (!res.ok) {
       let detail = `HTTP ${res.status}`;
@@ -1621,7 +1648,7 @@
       replaceWithImage(body, data.image, prompt);
       pushMessage('assistant', data.image, 'image', { prompt });
     } catch (err) {
-      replaceWithError(body, err.name === 'AbortError' ? "To'xtatildi" : err.message);
+      replaceWithError(body, err.name === 'AbortError' ? "To'xtatildi" : (err.message === 'Failed to fetch' ? apiDownMsg() : err.message));
     }
 
     state.isSending = false;
